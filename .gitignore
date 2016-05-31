@@ -3,3 +3,4 @@ lib/vendor
 node_modules
 
 dist
+.release.json
