@@ -1,5 +1,5 @@
 /**
- * ohmu.js (v1.0.0)
+ * ohmu.js (v2.0.0)
  *
  * Copyright (c) 2015 Scott Southworth & Contributors
  *
@@ -20,216 +20,143 @@
 
     "use strict";
 
-    var ohmu = {};
-    var bus = this.catbus;
-    var fileMonitor = bus.demandTree('OHMU'); // todo host should be defined within a tree
+    var context = this;
+    var Ohmu = {};
+
+    var plugins = typeof seele !== 'undefined' && seele;
+    if(plugins)
+        plugins.register('ohmu', Ohmu, true);
+    else
+        context.Ohmu = Ohmu; // bind to outer context
+
+    var ohmu = Ohmu;
+    var bus = plugins ? plugins.monolith('catbus') : context.Catbus;
+    var parser = plugins ? plugins.monolith('vash') : context.Vash;
+
+    var tree = bus.demandTree('OHMU'); // todo host should be defined within a tree
+
+    var fileStatusZone = tree.demandChild('fileContent'); // name is file, topics: update
+    var fileTextHash = {}; // files already loaded are here as key file, value text
+    var fileErrorHash = {}; // array of errors by file if present
+
     var suffixOnRequests = '';
 
-    var infoData = fileMonitor.demandData('INFO'); // topics are urls, data is full file dependency info
-    var contextHash = {};
+    var isReady = function(msg){ return msg === 'ready';};
+    var isFailed = function(msg){ return msg === 'failed';};
 
+    var uid = 0;
 
-
-    function getInfo(url){
-        return infoData.read(url);
-    }
-
-    ohmu.watch = function ohmu_watch(url){
-        return infoData.on(url)
-        .change(function(msg){ return msg && msg.status;});
+    ohmu.fileText = function(file){
+        return fileTextHash[file];
     };
 
-    ohmu.watch('*').change(function(info,url){ return info && (info.status + ':' + url);}).run(function(info, url){
-       console.log(info.status + ':' + url);
-    });
-
-    ohmu.parser = null;
-
-    ohmu.request = function ohmu_request(url, parser){
-        if(arguments.length === 1)
-            parser = ohmu.parser;
-        return doRequest(url, parser, null, url);
+    ohmu.fileErrors = function(file){
+        return fileErrorHash[file];
     };
 
-    function doRequest(url, parser, from, context){
+    ohmu.downloadFiles = function ohmu_downloadFiles(files, statusHandler){ // array of resolved urls
 
-        var info = getInfo(url);
+        if(typeof files === 'string')
+            files = [files];
 
-        if(!info) {
-            initRequest(url, parser, from, context);
-            return true;
-        }
-
-        return false;
-    }
-
-
-    ohmu.suffix = function suffix(suffix){
-        suffixOnRequests = suffix;
-    };
-
-
-    function evalContextStatus(need_info, context_url){
-
-        if(need_info.status === 'failed'){
-            failContext(context_url);
+        if(files.length === 0) {
+            statusHandler('ready');
             return;
         }
 
-        var context_needs = contextHash[context_url] || {};
-        for(var need_url in context_needs){
-            var need_status = getInfo(need_url).status;
-            if(need_status !== 'done' && need_status !== 'waiting')
-                return;
+        var incompleteFiles = [];
+
+        for(var i = 0; i < files.length; i++){
+            var f = files[i];
+            if(!fileTextHash.hasOwnProperty(f)) {
+                incompleteFiles.push(f);
+                download(f);
+            }
         }
 
-        completeContext(context_url);
-
-    }
-
-    function failContext(){
-
-
-    }
-
-    function addNeedToContext(need_url, context_url){
-
-
-        var context_needs = contextHash[context_url] = contextHash[context_url] || {};
-        if(context_needs[need_url])
-            return; // already present
-        context_needs[need_url] = true;
-        var need_info = getInfo(need_url);
-        need_info.context = context_url;
-        updateInfo(need_info);
-        infoData.on(need_url).host('OHMU_CONTEXT:'+context_url)
-            .change(function(msg){ return msg && msg.status;}).emit(context_url).run(evalContextStatus).auto();
-
-    }
-
-    function wipeContext(context_url){
-
-        //delete contextHash[context_url];?
-        bus.dropHost('OHMU_CONTEXT:'+context_url);
-
-    }
-
-    function completeContext(context_url){
-
-
-        var context_needs = contextHash[context_url] || {};
-        wipeContext(context_url);
-
-        for(var need_url in context_needs){
-            var need_info = getInfo(need_url);
-            need_info.status = 'done';
-            updateInfo(need_info);
-        }
-
-    }
-
-    function initRequest(url, parser, from, context) {
-
-        var info = {
-            url: url,
-            origin: from,
-            parser: parser,
-            context: context,
-            error_count: 0,
-            error_text: '',
-            file_text: '',
-            status: 'new', // (new, failed, loaded, parsed, done)
-            needs: null
-        };
-
-        updateInfo(info);
-        download(url, context);
-
-    }
-
-    function updateInfo(info){
-        infoData.write(info, info.url);
-    }
-
-
-    function parseNeeds(url){
-
-        var info = getInfo(url);
-        if(!info.parser)
+        if(incompleteFiles.length === 0) {
+            statusHandler('ready');
             return;
-
-        info.needs = info.parser(info.file_text) || {};
-        info.status = 'parsed';
-
-        updateInfo(info);
-
-    }
-
-    function downloadNeeds(url, context){
-
-
-        var info = getInfo(url);
-
-        for(var need in info.needs){
-            doRequest(need, info.parser, url, context);
-            addNeedToContext(need, context);
         }
-        addNeedToContext(context, context);
 
-        info.status = 'waiting';
-        updateInfo(info);
+        var batchId = ++uid + ':ohmu_batch';
+        var batchStatus = tree.demandData('batch');
+        batchStatus.write('pending', batchId);
+
+        batchStatus.on(batchId).host(batchId).change().run(function(msg){
+            statusHandler(msg);
+            bus.dropHost(batchId);
+        });
+
+        var fileContent = fileStatusZone.demandData(incompleteFiles);
+
+        var filesReady = fileContent.on('status').filter(isReady).batch().host(batchId);
+
+        var allFilesReady = filesReady.merge('status').group().batch().need(incompleteFiles)
+            .emit(batchId).transform('ready').pipe(batchStatus).host(batchId);
+
+        fileContent.on('status').filter(isFailed)
+            .emit(batchId).transform('failed').pipe(batchStatus).host(batchId);
+
+
+        filesReady.auto();
+        allFilesReady.auto();
+
+    };
+
+
+    function download(file){
+
+        var data = fileStatusZone.demandData(file);
+
+        if(!data.read('status')) {
+            data.write('new','status');
+            tryDownload(file);
+        }
 
     }
 
-    function storeResponse(url, response){
-        var info = getInfo(url);
-        info.file_text = info.parser ? response : null;
-        info.status = 'loaded';
-        updateInfo(info);
-    }
 
-    function download(url, context){
+    ohmu.cacheBuster = function cacheBuster(uniqueString){
+        suffixOnRequests = '?' + uniqueString;
+    };
 
-        $.ajax({url: url + suffixOnRequests, dataType: "text"})
+
+    function tryDownload(file){
+
+        var data = fileStatusZone.demandData(file);
+
+        $.ajax({url: file + suffixOnRequests, dataType: "text"})
             .done(function(response, status, xhr ){
 
-                storeResponse(url, response);
-                parseNeeds(url);
-                downloadNeeds(url, context);
+                fileTextHash[file] = response;
+                parser.parseFile(file, response);
+                data.write('ready', 'status');
 
             })
-            .fail(function(){
+            .fail(function(err){
 
-                var info = getInfo(url);
-                info.error_count++;
-                info.status = info.error_count > 3 ? 'failed' : 'error';
-                updateInfo(info);
+                var errors = fileErrorHash[file] = fileErrorHash[file] || [];
+                errors.push(err && err.responseText);
 
-                if(info.status === 'error')
-                    retryDownload(url);
+                var status = errors.length > 3 ? 'failed' : 'error';
+                data.write(status, 'status');
+
+                if(status === 'error')
+                    retryDownload(file);
 
             });
     }
 
-    function retryDownload(url){
+    function retryDownload(file){
 
-        var info = getInfo(url);
-        var delay = info.error_count * 1;
+        var error_count = (fileErrorHash[file] || []).length;
+        var delay = error_count * error_count * 10;
         setTimeout(function(){
-            download(url);
+            tryDownload(file);
         }, delay);
 
     }
 
-    if ((typeof define !== "undefined" && define !== null) && (define.amd != null)) {
-        define([], function() {
-            return ohmu;
-        });
-        this.ohmu = ohmu;
-    } else if ((typeof module !== "undefined" && module !== null) && (module.exports != null)) {
-        module.exports = ohmu;
-    } else {
-        this.ohmu = ohmu;
-    }
 
 }).call(this);
